@@ -1,0 +1,713 @@
+"""
+app/camera.py — Buka kamera dengan backend yang cocok dengan OS.
+
+Masalah yang diperbaiki: kode lama memakai cv2.CAP_DSHOW (DirectShow
+khusus Windows) untuk SEMUA OS -> di Linux kamera tidak pernah terbuka.
+Di sini backend dipilih berdasarkan platform:
+
+  Windows : DSHOW (DirectShow), fallback MSMF, fallback ANY
+  Linux   : V4L2, fallback ANY (otomatis cari /dev/videoN)
+
+Selalu kembalikan VideoCapture yang SUDAH terbuka, atau None (pemanggil
+harus siap menangani kamera None -> fallback frame sintetis).
+"""
+
+import json
+import os
+import platform
+import time
+
+import cv2
+
+
+
+
+CAM_MODE_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "data", "cam_mode.json")
+
+
+
+V4L_BY_ID_DIR = "/dev/v4l/by-id"
+
+
+CAM_RECONNECT_INTERVAL_S = 2.0
+CAM_FAIL_THRESHOLD = 10
+
+
+_FAST_SCAN_TRIED = set()
+_OPENCV_LOG_LEVEL_SAVED = None
+
+
+def _load_cam_cache():
+    """Baca cache mode kamera dari file JSON (None bila tak ada/rusak)."""
+    try:
+        with open(CAM_MODE_CACHE, "r") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _save_cam_cache(index, fourcc_val, width, height, fps, uid=None):
+    """Simpan mode kamera ke file JSON (termasuk UID persisten bila ada)."""
+    try:
+        os.makedirs(os.path.dirname(CAM_MODE_CACHE), exist_ok=True)
+        data = {
+            "index": int(index),
+            "fourcc": int(fourcc_val),
+            "width": int(width),
+            "height": int(height),
+            "fps": float(fps),
+        }
+        if uid:
+            data["uid"] = str(uid)
+        with open(CAM_MODE_CACHE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+
+def invalidate_cam_cache():
+    """Hapus cache mode kamera (dipanggil bila open gagal / ganti kamera).
+
+    Return True bila file dihapus, False bila tak ada/gagal.
+    """
+    try:
+        if os.path.exists(CAM_MODE_CACHE):
+            os.remove(CAM_MODE_CACHE)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _v4l_uid_for_index(index):
+    """UID persisten kamera index N dari symlink /dev/v4l/by-id.
+
+    Index V4L2 (= urutan colok) bisa berubah saat cabut-colok; nama
+    by-id (VID:PID + serial) stabil. Return nama symlink (mis.
+    'usb-046d_HD_Pro_Webcam_C920-video-index0') atau None bila tak ada.
+    """
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        return None
+    if not os.path.isdir(V4L_BY_ID_DIR):
+        return None
+    try:
+        names = os.listdir(V4L_BY_ID_DIR)
+    except OSError:
+        return None
+    target_suffix = f"video{idx}"
+    for name in sorted(names):
+        try:
+            link = os.readlink(os.path.join(V4L_BY_ID_DIR, name))
+        except OSError:
+            continue
+
+        if os.path.basename(link.rstrip("/")) == target_suffix:
+            return name
+    return None
+
+
+def list_cameras(max_index=6):
+    """Daftar kamera yang terdeteksi tanpa membuka frame penuh.
+
+    Tiap entri: {'index': int, 'uid': str|None, 'label': str}.
+    Di Linux: node /dev/videoN yang ada + nama by-id bila ketemu.
+    Di Windows: index 0..max_index (probing penuh dihindari di sini;
+    GUI memanggil rescan/open untuk validasi).
+    Return list (bisa kosong bila tak ada kamera).
+    """
+    found = []
+    if platform.system() == "Windows":
+        for i in range(int(max_index) + 1):
+            found.append({
+                "index": i,
+                "uid": None,
+                "label": f"Kamera {i}",
+            })
+        return found
+    for i in range(int(max_index) + 1):
+        if not _index_may_exist(i):
+            continue
+        uid = _v4l_uid_for_index(i)
+        if uid:
+
+
+            short = uid
+            for prefix in ("usb-",):
+                if short.startswith(prefix):
+                    short = short[len(prefix):]
+            short = short.rsplit("-video-index", 1)[0]
+            short = short.replace("_", " ")
+            label = f"{i}: {short}"
+        else:
+            label = f"Kamera {i}"
+        found.append({"index": i, "uid": uid, "label": label})
+    return found
+
+
+def _silence_opencv_warns():
+    """Bungkam WARN V4L2 saat probing (spam 'can't open camera by index').
+
+    OpenCV mencetak WARN langsung dari C++ ke stderr — tak lewat logger
+    Python — sehingga tiap VideoCapture() gagal memuntahkan 2 baris.
+    Fungsi ini menurunkan level ke ERROR sekali per sesi; WARN asli tetap
+    bisa dilihat bila level dikembalikan via _restore_opencv_logs().
+    """
+    global _OPENCV_LOG_LEVEL_SAVED
+    if _OPENCV_LOG_LEVEL_SAVED is not None:
+        return
+    try:
+        _OPENCV_LOG_LEVEL_SAVED = cv2.utils.logging.getLogLevel()
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        _OPENCV_LOG_LEVEL_SAVED = -1
+
+
+def _restore_opencv_logs():
+    """Kembalikan level log OpenCV ke semula (dipanggil usai negosiasi)."""
+    global _OPENCV_LOG_LEVEL_SAVED
+    if _OPENCV_LOG_LEVEL_SAVED in (None, -1):
+        return
+    try:
+        cv2.utils.logging.setLogLevel(_OPENCV_LOG_LEVEL_SAVED)
+    except Exception:
+        pass
+    finally:
+        _OPENCV_LOG_LEVEL_SAVED = None
+
+
+
+
+
+
+CAMERA_CANDIDATE_SIZES = (
+    (1920, 1080), (1600, 1200), (1280, 960), (1280, 720),
+    (1024, 768), (800, 600), (640, 480), (320, 240),
+)
+
+
+
+CAMERA_CODECS = ("MJPG", "YUYV")
+
+
+def _platform_backends():
+    """Backend cv2 sesuai OS (dipakai pembuka kamera & probing mode)."""
+    if platform.system() == "Windows":
+        return (cv2.CAP_DSHOW, cv2.CAP_MSMF, 0)
+    return (cv2.CAP_V4L2, 0)
+
+
+def _make_capture(index, backend):
+    """VideoCapture dengan backend tertentu; None bila gagal total."""
+    _silence_opencv_warns()
+    try:
+        return cv2.VideoCapture(int(index), backend)
+    except Exception:
+        return cv2.VideoCapture(int(index))
+
+
+def _apply_mode(cap, fourcc_val, width, height, target_fps):
+    """Terapkan codec + resolusi + fps ke capture yang sudah terbuka."""
+    if fourcc_val:
+        cap.set(cv2.CAP_PROP_FOURCC, int(fourcc_val))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+    if target_fps:
+        cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+
+def _measure_fps(cap, seconds=0.6):
+    """Ukur fps NYATA dengan membaca frame selama `seconds` detik."""
+    t0 = time.time()
+    n = 0
+    while time.time() - t0 < seconds:
+        if cap.read()[0]:
+            n += 1
+    dt = time.time() - t0
+    return n / dt if dt > 0 else 0.0
+
+
+def _open_capture_mode_for_backend(index, fourcc_val, width, height,
+                                   target_fps, backends):
+    """Buka kamera dengan mode tertentu via daftar backend eksplisit.
+
+    `backends` berupa tuple backend cv2 yang boleh dicoba (mis. hanya
+    V4L2 untuk probe cepat, atau (DSHOW, MSMF, ANY) untuk buka final).
+    Return: cv2.VideoCapture terbuka, atau None bila semua gagal.
+    """
+    for backend in backends:
+        cap = _make_capture(index, backend)
+        if cap is None or not cap.isOpened():
+            if cap is not None:
+                cap.release()
+            continue
+        _apply_mode(cap, fourcc_val, width, height, target_fps)
+        return cap
+    return None
+
+
+def _open_capture_mode(index, fourcc_val, width, height, target_fps):
+    """Buka kamera dengan mode tertentu; None bila semua backend gagal."""
+    return _open_capture_mode_for_backend(index, fourcc_val, width, height,
+                                          target_fps, _platform_backends())
+
+
+def _probe_mode(index, fourcc_val, width, height, target_fps, probe_seconds,
+                backends=None):
+    """Coba satu kandidat mode: buka, hangatkan, ukur fps nyata.
+
+    Return: (cap, fps_nyata); cap=None berarti mode tidak bisa dibuka.
+    `backends` membatasi backend yang dicoba (default: semua platform).
+    """
+    for backend in (backends or _platform_backends()):
+        cap = _open_capture_mode_for_backend(index, fourcc_val, width, height,
+                                             target_fps, (backend,))
+        if cap is None:
+            continue
+        for _ in range(6):
+            if cap.read()[0]:
+                break
+        fps = _measure_fps(cap, seconds=probe_seconds)
+        return cap, fps
+    return None, 0.0
+
+
+def negotiate_camera(index, target_fps=30, max_width=1920, max_height=1080,
+                     min_fps=25.0, probe_seconds=0.4):
+    """Cari mode terbaik: resolusi tertinggi yang tetap >= `min_fps` fps.
+
+    Mencoba kandidat resolusi dari tertinggi, masing-masing dengan codec
+    MJPG lalu YUYV, sampai menemukan yang terbuka DAN fps-nya memenuhi.
+    Kalau tidak ada yang memenuhi, kembalikan mode pertama yang terbuka
+    (`fallback`) atau None bila kamera sama sekali tidak bisa dibuka.
+
+    Return: (fourcc_val, width, height, fps_nyata) atau None.
+    """
+    sizes = [s for s in CAMERA_CANDIDATE_SIZES
+             if s[0] <= int(max_width) and s[1] <= int(max_height)]
+    if not sizes:
+        sizes = [(640, 480)]
+
+    fallback = None
+    for width, height in sizes:
+        for codec in CAMERA_CODECS:
+            fourcc_val = cv2.VideoWriter_fourcc(*codec)
+            cap, fps = _probe_mode(int(index), fourcc_val, width, height,
+                                   target_fps, probe_seconds)
+            if cap is None:
+                continue
+            real_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            real_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            if fallback is None:
+                fallback = (fourcc_val, real_w, real_h, fps)
+            if fps >= min_fps:
+                return (fourcc_val, real_w, real_h, fps)
+    return fallback
+
+
+def _index_may_exist(idx):
+    """Cek cepat apakah indeks kamera kemungkinan ada.
+
+    Di Linux cukup cek node /dev/videoN (menghindari probing memakan waktu
+    & spam warning untuk indeks kosong seperti /dev/video2 padahal hanya
+    ada 2 kamera). Di Windows probing langsung lebih aman (tidak ada node).
+    """
+    if platform.system() == "Windows":
+        return True
+    return os.path.exists(f"/dev/video{int(idx)}")
+
+
+def _probe_index_quality(index, target_fps):
+    """Skor cepat ukuran piksel yang bisa dikeluarkan sebuah index kamera.
+
+    Hanya pakai backend native (V4L2 di Linux / DSHOW di Windows) dengan
+    satu mode 1280x720 MJPG — tidak dilakukan eksplorasi panjang. Tujuan:
+    membandingkan antar index dengan cepat (~0,5-1 s) sebelum memutuskan
+    index terbaik. Return (width, height, fps) hasil clamp kamera, atau
+    None bila lewat backend native kamera tak bisa dibuka.
+    """
+    native = (_platform_backends()[0],)
+    fourcc_val = cv2.VideoWriter_fourcc(*"MJPG")
+    cap, fps = _probe_mode(int(index), fourcc_val, 1280, 720,
+                           target_fps, 0.4, backends=native)
+    if cap is None:
+
+        for backend in native:
+            cap2 = _make_capture(int(index), backend)
+            if cap2 is not None and cap2.isOpened():
+                cap2.read()
+                w = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap2.release()
+                return (w, h, 0.0)
+        return None
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return (w, h, fps)
+
+
+def negotiate_best_camera(preferred, target_fps=30, max_width=1920,
+                          max_height=1080, min_fps=25.0, max_index=4,
+                          force_renegotiate=False):
+    """Pilih kamera terbaik sekaligus mode terbaiknya.
+
+    `preferred` dicoba lebih dulu; selanjutnya index 0..max_index lain
+    (yang node-nya ada). Setiap index di-skor cepat (lihat
+    `_probe_index_quality`), lalu hanya index dengan luas piksel terbesar
+    yang di-negosiasi penuh. Seri diputuskan fps, lalu index (preferen).
+
+    Cache: simpan/baca hasil negosiasi ke `data/cam_mode.json`
+    (termasuk UID persisten by-id). Bila UID berubah (cabut-colok pindah
+    port USB) cache diabaikan + dihapus agar tak mengunci index basi.
+    `force_renegotiate=True` paksa negosiasi ulang (bila kamera ganti).
+
+    Return: (index_terpilih, fourcc_val, width, height, fps) atau None.
+    """
+
+    if not force_renegotiate:
+        cache = _load_cam_cache()
+        if (cache and cache.get("index") == int(preferred)
+                and cache.get("width", 0) <= int(max_width)
+                and cache.get("height", 0) <= int(max_height)):
+            cached_uid = cache.get("uid")
+            live_uid = _v4l_uid_for_index(int(preferred))
+            if cached_uid and live_uid and cached_uid != live_uid:
+
+                print(f"[CAM] UID berubah ({cached_uid} -> {live_uid}); "
+                      "cache dibuang, negosiasi ulang.")
+                invalidate_cam_cache()
+            else:
+                fourcc_val = cache.get("fourcc")
+                width = cache.get("width")
+                height = cache.get("height")
+                fps = cache.get("fps", 0.0)
+                print(f"[CAM] Mode cache index={preferred}: {width}x{height} "
+                      f"{fps:.0f} fps.")
+
+
+                _probe = _make_capture(int(preferred),
+                                       _platform_backends()[0])
+                if _probe is not None and _probe.isOpened():
+                    _probe.release()
+                    return (int(preferred), fourcc_val, width, height, fps)
+                if _probe is not None:
+                    _probe.release()
+                print(f"[CAM] Cache index={preferred} basi (tak bisa "
+                      "dibuka); negosiasi ulang.")
+                invalidate_cam_cache()
+
+    order = [int(preferred)]
+    for i in range(int(max_index) + 1):
+        if i not in order and _index_may_exist(i):
+            order.append(i)
+
+    scores = {}
+    for idx in order:
+        s = _probe_index_quality(idx, target_fps)
+        if s is not None:
+            scores[idx] = s
+    if not scores:
+        return None
+
+    prefer_pos = {idx: pos for pos, idx in enumerate(order)}
+
+    def _rank(idx):
+        w, h, fps = scores[idx]
+        return (w * h, fps, -prefer_pos[idx])
+
+    best_idx = max(scores, key=_rank)
+
+
+
+    mode = negotiate_camera(best_idx, target_fps=target_fps,
+                            max_width=max_width, max_height=max_height,
+                            min_fps=min_fps)
+    if mode is None:
+        w, h, fps = scores[best_idx]
+        mode = (cv2.VideoWriter_fourcc(*"MJPG"), w, h, fps)
+    if best_idx != int(preferred):
+        print(f"[CAM] Kamera {int(preferred)} resolusinya lebih kecil; "
+              f"pakai index {best_idx} (area terbesar).")
+
+    _save_cam_cache(best_idx, mode[0], mode[1], mode[2], mode[3],
+                    uid=_v4l_uid_for_index(best_idx))
+    return (best_idx, mode[0], mode[1], mode[2], mode[3])
+
+
+def _open_fast_primary(index, target_fps):
+    """Buka kamera utama TANPA negosiasi panjang (fast-start).
+
+    Pakai mode tersimpan di cache (data/cam_mode.json) bila cocok; kalau
+    tidak, default 1280x720 MJPG. Hanya 1 open per backend, pemanasan 3
+    frame, tanpa kalibrasi exposure dan tanpa sweep resolusi/codec —
+    startup turun drastis (penting di Windows yang mem-probe 0..4 tiap
+    kali). Return cap atau None.
+    """
+    cache = _load_cam_cache()
+    fourcc = w = h = None
+    if cache and cache.get("index") == int(index):
+        fourcc = cache.get("fourcc")
+        w = cache.get("width")
+        h = cache.get("height")
+    if not w or not h:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        w, h = 1280, 720
+    _silence_opencv_warns()
+    cap = None
+    for backend in _platform_backends():
+        c = _make_capture(int(index), backend)
+        if c is None or not c.isOpened():
+            if c is not None:
+                try:
+                    c.release()
+                except Exception:
+                    pass
+            continue
+        try:
+            if fourcc:
+                c.set(cv2.CAP_PROP_FOURCC, int(fourcc))
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+            if target_fps:
+                c.set(cv2.CAP_PROP_FPS, float(target_fps))
+            try:
+                c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        ok_read = False
+        for _ in range(3):
+            try:
+                if c.read()[0]:
+                    ok_read = True
+                    break
+            except Exception:
+                break
+        if ok_read:
+            cap = c
+            break
+        try:
+            c.release()
+        except Exception:
+            pass
+    if cap is not None:
+        print(f"[CAM] Fast-start index={index}: {w}x{h} "
+              f"(mode {'cache' if cache else 'default'}).")
+        _restore_opencv_logs()
+        return cap
+    # Fast-start gagal di index terkonfigurasi — coba cari kamera lain
+    # (scan sekali per proses per index, supaya tidak berulang tiap
+    # reconnect). Tanpa ini: "backend gagal membuka kamera" berulang.
+    if index not in _FAST_SCAN_TRIED:
+        _FAST_SCAN_TRIED.add(index)
+        cap = find_working_camera(preferred=index)
+    _restore_opencv_logs()
+    return cap
+
+
+def _open_auto_negotiated(index, target_fps=None):
+    """Buka kamera terbaik dengan resolusi tertinggi & fps stabil."""
+    from . import settings as cfg
+
+    target = target_fps or cfg.CAMERA_TARGET_FPS
+    if getattr(cfg, "CAMERA_FAST_START", True):
+        return _open_fast_primary(index, target)
+    best = negotiate_best_camera(index,
+                                 target_fps=target,
+                                 max_width=cfg.CAMERA_MAX_AUTO_WIDTH,
+                                 max_height=cfg.CAMERA_MAX_AUTO_HEIGHT,
+                                 min_fps=cfg.CAMERA_MIN_ACCEPT_FPS)
+    if best is None:
+        return None
+    chosen_idx, fourcc_val, width, height, fps = best
+    codec_name = "MJPG" if fourcc_val == cv2.VideoWriter_fourcc(*"MJPG") else "YUYV"
+    print(f"[CAM] Mode negosiasi kamera index={chosen_idx}: {width}x{height} "
+          f"{fps:.0f} fps ({codec_name}).")
+    cap = _open_capture_mode(int(chosen_idx), fourcc_val, width, height, target)
+    if cap is not None:
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        _calibrate_exposure(cap)
+    return cap
+
+
+def open_camera(index, width=None, height=None, target_fps=None,
+                auto_highest=False):
+    """Buka kamera `index` dengan backend sesuai OS.
+
+    Argumen:
+        index : int — indeks kamera (0 = kamera default/pertama).
+        width, height : int|None — resolusi yang diminta; kalau tidak
+            didukung kamera, resolusi native tetap dipakai (tidak fatal).
+        target_fps : int|None — fps yang diusahakan (via CAP_PROP_FPS).
+        auto_highest : bool — bila True, abaikan width/height dan pakai
+            hasil negosiasi kamera terbaik: index dengan resolusi tertinggi
+            yang fps-nya stabil (lihat negotiate_best_camera). Dipakai
+            kamera navigasi utama.
+
+    Return:
+        cv2.VideoCapture yang isOpened()==True, atau None bila semua
+        backend gagal.
+    """
+    if auto_highest:
+        cap = _open_auto_negotiated(index, target_fps)
+        _restore_opencv_logs()
+        if cap is not None:
+            return cap
+        print(f"[CAM] Negosiasi mode gagal untuk index={index}, "
+              "lanjut ke mode lama.")
+
+    _silence_opencv_warns()
+    last_error = None
+    for backend in _platform_backends():
+        try:
+            cap = cv2.VideoCapture(int(index), backend)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if cap.isOpened():
+            if width and height:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+            if target_fps:
+                cap.set(cv2.CAP_PROP_FPS, float(target_fps))
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            _calibrate_exposure(cap)
+            _restore_opencv_logs()
+            return cap
+        cap.release()
+
+    print(f"[CAM] Semua backend gagal membuka kamera index={index} "
+          f"(terakhir: {last_error})")
+    _restore_opencv_logs()
+    return None
+
+
+def _calibrate_exposure(cap, warmup=8):
+    """Coba beberapa mode auto-exposure dan pakai yang paling terang.
+
+    Kamera laptop (UVC) sering memberi frame hitam total bila mode
+    exposure salah default-nya. Nilai yang dicoba khusus Linux:
+      3.0 = auto (constant FPS)  1.0 = auto  0.75 = auto (logika lain)
+    Di Windows mode bawaan DSHOW sudah benar, jadi tidak diotak-atik.
+    """
+    if platform.system() == "Windows":
+        return
+
+    def _brightness():
+        for _ in range(warmup):
+            cap.read()
+        r, fr = cap.read()
+        return float(fr.mean()) if r and fr is not None else -1.0
+
+    best_val, best_brightness = None, float(_brightness())
+    if best_brightness < 15.0:
+        for val in (3.0, 1.0, 0.75):
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, val)
+            except Exception:
+                continue
+            b = _brightness()
+            if b > best_brightness:
+                best_val, best_brightness = val, b
+        if best_val is not None:
+            try:
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, best_val)
+            except Exception:
+                pass
+            _brightness()
+
+
+def find_working_camera(preferred=None, max_index=4, width=None, height=None):
+    """Cari kamera yang BISA dibuka.
+
+    Prioritas: `preferred` (bisa None), lalu index 0..max_index. Berguna
+    bila config.CAMERA_INDEX menunjuk kamera yang tidak ada di mesin ini
+    (mis. di-set 1 untuk laptop lain) — app tetap dapat menampilkan kamera
+    yang tersedia sambil log index yang dipakai.
+
+    Return: cv2.VideoCapture terbuka, atau None.
+    """
+    order = []
+    if preferred is not None:
+        order.append(int(preferred))
+    for i in range(max_index + 1):
+        if i not in order:
+            order.append(i)
+
+    for idx in order:
+        cap = open_camera(idx, width, height)
+        if cap is not None:
+            if idx != preferred:
+                print(f"[CAM] Kamera index {preferred} tidak tersedia, "
+                      f"pakai index {idx}.")
+            _restore_opencv_logs()
+            return cap
+    _restore_opencv_logs()
+    return None
+
+
+def make_fallback_frame(width, height, text="CAMERA ERROR"):
+    import numpy as np
+    frame = np.zeros((int(height), int(width), 3), dtype=np.uint8)
+    cv2.putText(frame, text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                1, (0, 0, 255), 2)
+    return frame
+
+
+_FLIP_MODE_TO_CV2_CODE = {
+    0: None,     
+    1: 1,        
+    2: 0,      
+    3: -1,       
+}
+
+
+def flip_frame_if_needed(frame, flip_mode=1):
+    code = _FLIP_MODE_TO_CV2_CODE.get(int(flip_mode))
+    if code is None:
+        return frame
+    return cv2.flip(frame, code)
+
+
+
+TARGET_FPS = 30
+TARGET_INTERVAL_S = 1.0 / TARGET_FPS
+
+
+def _get_loop_fps():
+    try:
+        from . import settings as cfg
+        fps = float(getattr(cfg, "NAV_LOOP_FPS", TARGET_FPS) or TARGET_FPS)
+        if fps <= 0:
+            return TARGET_FPS
+        return fps
+    except Exception:
+        return TARGET_FPS
+
+def pace_to_fps(next_deadline, fps=None):
+    """Tidur sampai deadline monotonic; return deadline berikutnya."""
+    if fps is None:
+        fps = _get_loop_fps()
+    interval = 1.0 / fps if fps > 0 else TARGET_INTERVAL_S
+    now = time.monotonic()
+    sleep_s = next_deadline - now
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+        return next_deadline + interval
+    return now + interval

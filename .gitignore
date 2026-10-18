@@ -1,0 +1,44 @@
+# ============================================================
+# .gitignore — asv-windows (repo lomba, Windows)
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Output runtime (folder kerja kapal) — dibuat otomatis saat run
+data/*
+!data/README.md
+
+# Media
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.mp4
+*.avi
+
+# Peta sementara yang di-generate GUI
+temp_map.html
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / tooling
+.vscode/
+.idea/
+*.swp
+
+# Build artifacts — TAPI core/aterkia_core.dll DI-COMMIT
+# (supaya laptop Windows tinggal run tanpa MinGW)
+*.so
+*.dll
+!core/aterkia_core.dll
+core/build/

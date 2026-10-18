@@ -1,0 +1,38 @@
+# ============================================================
+# requirements.txt — dependensi ASV (Windows, RINGAN, tanpa torch).
+#
+# Inferensi YOLO lewat ONNX + cv2.dnn (app/yolo_onnx.py) jadi
+# torch/torchvision/ultralytics TIDAK dibutuhkan saat runtime.
+#
+# Setup (otomatis, buat .venv + install + verifikasi):
+#   scripts\setup_windows.bat
+# Manual:
+#   python -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+# Verifikasi:
+#   .venv\Scripts\python scripts\verify_env.py
+#
+# Catatan:
+#  - Wajib Python 3.12+ 64-bit (numpy 2.5.3 & pymavlink 2.4.50
+#    menyediakan wheel Windows mulai Python 3.12).
+#  - Jangan pin PyQt5-Qt5: versi Windows yang tersedia di PyPI
+#    berbeda dengan Linux; biar pip menyesuaikan.
+#  - opencv WAJIB varian *headless* (GUI pakai PyQt5, bukan cv2 GUI).
+#  - ctypes memuat core/aterkia_core.dll (sudah di-commit; rebuild:
+#    make -C core windows, butuh MinGW).
+# ============================================================
+
+# --- GUI ---
+PyQt5==5.15.11
+
+# --- Visi komputer (ONNX via cv2.dnn; headless saja) ---
+opencv-python-headless==5.0.0.93
+numpy==2.5.3
+
+# --- Telemetri Pixhawk / MAVLink ---
+pymavlink==2.4.50
+fastcrc==0.5.0
+pyserial==3.5
+
+# --- Peta (slim_map murni Qt; lxml untuk parsing) ---
+lxml==6.1.3
