@@ -54,19 +54,17 @@ def clamp1(v):
 
 
 def convert_manual_control(msg):
-    """MAVLink MANUAL_CONTROL -> (surge, yaw) masing-masing [-1, 1].
-
-    surge = throttle (z): 0 mundur penuh, Z_NEUTRAL netral, 1000 maju penuh.
-    yaw   = stik kanan (r): -127 kiri penuh, 0 lurus, +127 kanan penuh.
-    x (rush) & y (roll) diabaikan — ASV permukaan hanya punya dua DOF.
-    """
+    """MAVLink MANUAL_CONTROL -> (surge, yaw) masing-masing [-1, 1]."""
     try:
         z = float(getattr(msg, "z", Z_NEUTRAL))
         r = float(getattr(msg, "r", 0.0))
     except (TypeError, ValueError):
         return 0.0, 0.0
-    if z < Z_MIN or z > Z_MAX:
+    return convert_zr(z, r)
 
+
+def convert_zr(z, r):
+    if z < Z_MIN or z > Z_MAX:
         return 0.0, 0.0
     surge = (z - Z_NEUTRAL) / (Z_MAX - Z_NEUTRAL)
     yaw = r / R_FULL
@@ -86,6 +84,7 @@ class QgcOffboard:
     def __init__(self, config):
         self.config = config
         self.master = None
+        self.feed = None
         self._mode = None
         self._last_rx_mono = None
         self._surge = 0.0
@@ -95,9 +94,10 @@ class QgcOffboard:
                           "mode": 0, "mode_name": "AUTO", "rc_ok": False,
                           "source": "AUTO", "qgc_ok": False}
 
-    def attach_mav(self, master):
-        """Sambungkan koneksi pymavlink (boleh None = QGC tak terlihat)."""
+    def attach_mav(self, master, telemetry=None):
+        """Sambungkan koneksi + cache pembaca tunggal (boleh None)."""
         self.master = master
+        self.feed = telemetry
 
     def _drain(self):
         """Ambil semua paket MANUAL_CONTROL tertunda (non-blocking).
@@ -131,24 +131,31 @@ class QgcOffboard:
         if self._mode is None:
             self._mode = core.ModeState()
 
-        msg = self._drain()
         now = self._clock()
-        fresh = False
-        if msg is not None:
-            self._surge, self._yaw = convert_manual_control(msg)
-            self._last_rx_mono = now
-            fresh = True
-            if throttled("qgc_rx", 5.0):
-                log.info("QGC MANUAL_CONTROL diterima "
-                         "(surge %+.2f yaw %+.2f)", self._surge, self._yaw)
-        elif self._last_rx_mono is not None:
-            timeout_s = float(getattr(self.config,
-                                      "QGC_MANUAL_TIMEOUT_S", 0.5))
-            fresh = (now - self._last_rx_mono) <= timeout_s
-            if not fresh and throttled("qgc_lost", 5.0):
-                log.warning("QGC putus > %.2f dtk -> netral (HOLD)",
-                            timeout_s)
-
+        timeout_s = float(getattr(self.config, "QGC_MANUAL_TIMEOUT_S", 0.5))
+        if self.feed is not None:
+            mc = self.feed.manual_control
+            fresh = mc is not None and (now - mc[2]) <= timeout_s
+            if fresh:
+                self._surge, self._yaw = convert_zr(mc[0], mc[1])
+                if (self._last_rx_mono is None
+                        or now - self._last_rx_mono > 1.0):
+                    log.info("QGC MANUAL_CONTROL diterima "
+                             "(surge %+.2f yaw %+.2f)",
+                             self._surge, self._yaw)
+                self._last_rx_mono = now
+        else:
+            msg = self._drain()
+            fresh = False
+            if msg is not None:
+                self._surge, self._yaw = convert_manual_control(msg)
+                self._last_rx_mono = now
+                fresh = True
+            elif self._last_rx_mono is not None:
+                fresh = (now - self._last_rx_mono) <= timeout_s
+        if not fresh and self._last_rx_mono is not None \
+                and throttled("qgc_lost", 5.0):
+            log.warning("QGC putus > %.2f dtk -> netral (HOLD)", timeout_s)
 
         surge = self._surge if fresh else 0.0
         yaw = self._yaw if fresh else 0.0

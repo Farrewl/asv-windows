@@ -221,9 +221,14 @@ class VisionNavigator:
 
 
         self.pixhawk_check = "menunggu MAVLink"
-        threading.Thread(target=self._pixhawk_param_check_worker,
-                         daemon=True).start()
-
+        self._param_spec = None
+        self._param_fw = "?"
+        self._param_until = 0.0
+        self._param_next = 0.0
+        self._last_flight_mode = None
+        self._expect_mode = None
+        self._last_cmd_mode = None
+        self._det_seq = -1
 
         self.video_writer = None
 
@@ -309,19 +314,19 @@ class VisionNavigator:
         if ok:
             self._mav_reason = ""
             try:
-                self.manual_link.attach_mav(self.mav.master)
-                self.qgc_link.attach_mav(self.mav.master)
+                self.manual_link.attach_mav(self.mav.master, self.mav)
+                self.qgc_link.attach_mav(self.mav.master, self.mav)
                 self.output.attach_mav(self.mav.master)
             except Exception:
                 pass
-            if os.environ.get("GCS_FORWARD", "0") == "1":
-                try:
-                    self.mav.enable_gcs_forward(
-                        True,
-                        ip=os.environ.get("GCS_IP", "127.0.0.1"),
-                        port=int(os.environ.get("GCS_PORT", "14550")))
-                except Exception:
-                    pass
+            self._last_flight_mode = None
+            self._expect_mode = None
+            self._last_cmd_mode = None
+            self._param_spec = None
+            self._param_next = 0.0
+            self._apply_gcs_forward()
+            if not self.auto_started:
+                self._command_mode(getattr(self.config, "FLIGHT_MODE_HOLD", 4))
             if self._mav_port_logged != self.mav.port:
                 self._mav_port_logged = self.mav.port
                 log.info("Telemetri AKTIF via %s.", self.mav.port)
@@ -333,6 +338,26 @@ class VisionNavigator:
             self._mav_reason = " NO-HB"
         return ok
 
+    def _apply_gcs_forward(self):
+        mav = self.mav
+        if mav is None or not mav.connected:
+            return
+        want = bool(getattr(self.config, "GCS_FORWARD", True))
+        try:
+            if want and not mav.gcs_active:
+                mav.enable_gcs_forward(
+                    True,
+                    ip=str(getattr(self.config, "GCS_IP", "127.0.0.1")),
+                    port=int(getattr(self.config, "GCS_PORT", 14550)))
+            elif not want and mav.gcs_active:
+                mav.enable_gcs_forward(False)
+        except Exception:
+            pass
+
+    def _command_mode(self, mode_id):
+        self._expect_mode = int(mode_id)
+        return self.output.set_flight_mode(int(mode_id))
+
     def _poll_telemetry(self):
         self._mav_ensure_connected()
         mav = self.mav
@@ -342,6 +367,8 @@ class VisionNavigator:
             mav.poll()
         except Exception:
             return
+        self._apply_gcs_forward()
+        self._pixhawk_check_tick()
         if mav.has_attitude:
             self.safety.mark_telem()
             self.current_yaw_rad = math.radians(mav.yaw_deg)
@@ -395,6 +422,11 @@ class VisionNavigator:
 
 
     def _request_detections(self, frame):
+        if self.cam is not None:
+            seq = self.cam.primary_seq
+            if seq == self._det_seq:
+                return
+            self._det_seq = seq
         self._frame_seq += 1
         skip = int(getattr(self.config, "YOLO_FRAME_SKIP", 2))
         if skip >= 0 and self._frame_seq % (skip + 1) != 0:
@@ -811,35 +843,39 @@ class VisionNavigator:
         except Exception:
             return {"yaw_bias": 0.0, "memory_s": 0.0, "active": False}
 
-    def _pixhawk_param_check_worker(self):
-        from .pixhawk_check import (load_spec, check_params, summarize,
-                                    detect_autopilot, spec_path_for,
-                                    firmware_name)
-        deadline = time.time() + 10.0
-        while time.time() < deadline:
-            mav = self.mav
-            master = mav.master if mav is not None else None
-            if master is not None and mav is not None and mav.connected:
-                ap = detect_autopilot(master)
-                fw = firmware_name(ap)
-                try:
-                    spec = load_spec(spec_path_for(ap))
-                except Exception as e:
-                    self.pixhawk_check = f"spec gagal dibaca ({e})"
-                    log.warning("[PIXHAWK-CHECK] %s", self.pixhawk_check)
-                    return
-                try:
-                    results = check_params(master, spec)
-                except Exception as e:
-                    self.pixhawk_check = f"gagal ({e})"
-                    log.warning("[PIXHAWK-CHECK] %s", self.pixhawk_check)
-                    return
-                self.pixhawk_check = f"[{fw}] {summarize(results)}"
-                log.info("[PIXHAWK-CHECK] %s", self.pixhawk_check)
+    def _pixhawk_check_tick(self):
+        """Cek parameter dari cache poll() — minta ulang, lalu evaluasi."""
+        mav = self.mav
+        if mav is None or not mav.connected:
+            return
+        now = time.monotonic()
+        if self._param_spec is None:
+            if now < self._param_next:
                 return
-            time.sleep(0.5)
-        self.pixhawk_check = "MAVLink tidak tersambung (cek dilewati)"
-
+            from .pixhawk_check import (load_spec, spec_path_for,
+                                        firmware_name)
+            ap = mav.autopilot_id
+            try:
+                spec = load_spec(spec_path_for(ap))
+            except Exception as e:
+                self.pixhawk_check = f"spec gagal dibaca ({e})"
+                self._param_next = now + 60.0
+                return
+            self._param_fw = firmware_name(ap)
+            self._param_spec = spec
+            self._param_until = now + 12.0
+            mav.request_params([p["name"] for p in spec])
+            return
+        vals = mav.param_values
+        done = all(p["name"] in vals for p in self._param_spec)
+        if not done and now < self._param_until:
+            return
+        from .pixhawk_check import evaluate, summarize
+        results = evaluate(self._param_spec, vals)
+        self.pixhawk_check = f"[{self._param_fw}] {summarize(results)}"
+        log.info("[PIXHAWK-CHECK] %s", self.pixhawk_check)
+        self._param_spec = None
+        self._param_next = now + 60.0
 
 
 
@@ -966,14 +1002,11 @@ class VisionNavigator:
 
 
     def start_auto(self):
-        """Operator tekan MULAI: minta Pixhawk masuk mode misi (AUTO/GUIDED).
-
-        Sebelum ini kapal tetap HOLD (aman). Dipanggil dari GUI thread —
-        hanya menyalakan flag & kirim DO_SET_MODE; loop yang bergerak.
-        """
+        """Operator tekan MULAI: lepas HOLD dan masuk mode misi (GUIDED)."""
         self.auto_started = True
         try:
-            self.output.request_offboard()
+            self._command_mode(
+                int(getattr(self.config, "FLIGHT_MODE_OFFBOARD", 15)))
         except Exception as e:
             log.warning("Gagal kirim OFFBOARD: %s", e)
         log.info("Operator: MULAI AUTO — kapal lepas dari HOLD.")
@@ -982,21 +1015,31 @@ class VisionNavigator:
         """Operator tekan HOLD: kapal berhenti di tempat, kembali HOLD."""
         self.auto_started = False
         try:
-            self.output.request_hold()
+            self._command_mode(
+                int(getattr(self.config, "FLIGHT_MODE_HOLD", 4)))
         except Exception as e:
             log.warning("Gagal kirim HOLD: %s", e)
         log.info("Operator: HOLD — kapal ditahan di tempat.")
 
     def _sync_auto_from_qgc(self):
-        """Mirror custom_mode HEARTBEAT (QGC) -> auto_started.
+        """Mirror perubahan mode Pixhawk (QGC) -> auto_started.
 
-        Bila operator mengubah mode lewat QGroundControl (AUTO/GUIDED),
-        navigator ikut start; kalau ke MANUAL/HOLD, navigator ikut hold.
+        Hanya reaksi saat custom_mode BERUBAH, dan mode hasil perintah kita
+        sendiri (`_expect_mode`) tidak dipakai untuk mengubah state.
         """
         if self.mav is None:
             return
         mid = getattr(self.mav, "flight_mode_id", None)
         if mid is None:
+            return
+        if self._last_flight_mode is None:
+            self._last_flight_mode = mid
+            return
+        if mid == self._last_flight_mode:
+            return
+        self._last_flight_mode = mid
+        if mid == self._expect_mode:
+            self._expect_mode = None
             return
         auto_ids = {int(getattr(self.config, "FLIGHT_MODE_AUTO", 10)),
                     int(getattr(self.config, "FLIGHT_MODE_OFFBOARD", 15))}
@@ -1006,6 +1049,7 @@ class VisionNavigator:
             self.auto_started = True
         elif mid in hold_ids:
             self.auto_started = False
+            self.manual_gui_request = False
 
     def _set_state(self, new_state):
         if self.current_state == new_state:
@@ -1214,9 +1258,17 @@ class VisionNavigator:
                 op_mode = "MANUAL"
 
             self._sync_auto_from_qgc()
-            if not self.auto_started:
+            if not self.auto_started and op_mode not in ("MANUAL", "KILL"):
                 # Startup aman / operator tekan HOLD: kapal ditahan.
                 op_mode = "HOLD"
+            if op_mode != self._last_cmd_mode:
+                self._last_cmd_mode = op_mode
+                if op_mode in ("AUTO", "MANUAL"):
+                    self._command_mode(int(getattr(
+                        self.config, "FLIGHT_MODE_OFFBOARD", 15)))
+                elif op_mode == "HOLD":
+                    self._command_mode(int(getattr(
+                        self.config, "FLIGHT_MODE_HOLD", 4)))
 
             _t0 = time.monotonic() if self._fps_dbg_on else 0.0
             frame, sec, cam_st = self._read_frames()
@@ -1689,7 +1741,10 @@ class VisionNavigator:
             "frame_secondary": sec if video_due else None,
             "video_due": video_due,
             "cam_status": cam_st,
+            "cam_fps": (float(self.cam.primary_fps)
+                        if self.cam is not None else 0.0),
             "op_mode": op_mode,
+            "auto_started": bool(self.auto_started),
             "manual_active": bool(man.get("active", False)),
             "manual_surge": float(man.get("surge", 0.0)),
             "manual_yaw": float(man.get("yaw", 0.0)),

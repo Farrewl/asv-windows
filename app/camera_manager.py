@@ -218,6 +218,20 @@ class CameraManager:
                                     flip_mode=flip)
         self._reported_retry = {"NAV": False, "BAWAH": False}
 
+        # Cache frame NAV + thread pembaca: loop navigasi tidak menunggu
+        # cap.read() (blocking) sehingga pacing fps tetap stabil.
+        self._prim_lock = threading.Lock()
+        self._prim_latest = None
+        self._prim_ts = 0.0
+        self._prim_status = "NO_CAM"
+        self._prim_seq = 0
+        self._prim_fps = 0.0
+        self._prim_running = threading.Event()
+        self._prim_running.set()
+        self._prim_thread = threading.Thread(
+            target=self._prim_loop, daemon=True, name="prim-reader")
+        self._prim_thread.start()
+
         # Cache frame bawah + thread pembaca (di balik lock kecil).
         self._cache_lock = threading.Lock()
         self._sec_latest = None
@@ -229,6 +243,33 @@ class CameraManager:
         self._sec_thread.start()
 
     # ---- thread reader kamera bawah --------------------------------
+    def _prim_loop(self):
+        """Baca kamera NAV terus-menerus -> cache frame terbaru."""
+        n, t0 = 0, time.monotonic()
+        while self._prim_running.is_set():
+            try:
+                with self._lock_prim:
+                    ok, frame, st = self.primary.read()
+            except Exception:
+                ok, frame, st = False, None, "RETRY"
+            if ok and frame is not None:
+                now = time.monotonic()
+                with self._prim_lock:
+                    self._prim_latest = frame
+                    self._prim_ts = now
+                    self._prim_status = "OK"
+                    self._prim_seq += 1
+                n += 1
+                dt = now - t0
+                if dt >= 1.0:
+                    self._prim_fps = n / dt
+                    n, t0 = 0, now
+            else:
+                with self._prim_lock:
+                    self._prim_status = st
+                self._prim_fps = 0.0
+                time.sleep(0.01)
+
     def _sec_loop(self):
         """Baca kamera bawah terus-menerus -> cache. Tak menyentuh NAV."""
         interval = 1.0 / float(self._sec_fps)
@@ -263,16 +304,14 @@ class CameraManager:
         return frame
 
     def read_primary(self, fb_width=1280, fb_height=720):
-        """Frame navigasi + teks status jujur untuk fallback."""
-        with self._lock_prim:
-            ok, frame, st = self.primary.read()
-        if ok and frame is not None:
+        """Frame NAV terbaru dari cache (non-blocking) + teks status."""
+        with self._prim_lock:
+            frame = self._prim_latest
+            ts = self._prim_ts
+            st = self._prim_status
+        if frame is not None and (time.monotonic() - ts) <= 1.0:
             self._reported_retry["NAV"] = False
             return True, frame, "OK"
-        if st == "REOPENED":
-            self._reported_retry["NAV"] = False
-            if frame is not None:
-                return True, frame, "REOPENED"
         if st in ("RETRY", "NO_CAM"):
             if not self._reported_retry["NAV"]:
                 self._reported_retry["NAV"] = True
@@ -287,6 +326,15 @@ class CameraManager:
         fb = (make_fallback_frame(fb_width, fb_height,
                                   text="KAMERA ERROR") if _CV2_OK else None)
         return False, fb, st
+
+    @property
+    def primary_seq(self):
+        with self._prim_lock:
+            return self._prim_seq
+
+    @property
+    def primary_fps(self):
+        return float(self._prim_fps)
 
     def read_secondary(self, max_width=320):
         """Ambil cache kamera bawah (NON-BLOCKING) atau None bila belum ada.
@@ -348,6 +396,13 @@ class CameraManager:
         return {"primary": prim, "secondary": sec}
 
     def close(self):
+        try:
+            self._prim_running.clear()
+            th = self._prim_thread
+            if th is not None and th.is_alive():
+                th.join(timeout=1.0)
+        except Exception:
+            pass
         try:
             self._sec_running.clear()
             th = self._sec_thread

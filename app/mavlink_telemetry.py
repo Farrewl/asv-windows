@@ -36,6 +36,9 @@ except ImportError:
     _list_ports = None
     _LIST_PORTS_OK = False
 
+from .pixhawk_check import decode_param
+from .logutil import throttled
+
 
 
 
@@ -169,6 +172,16 @@ class MavlinkTelemetry:
         self._current_a = None
         self._battery_pct = None
         self._flight_mode_id = None
+        self._autopilot = None
+
+        # Cache pesan untuk konsumen lain (satu-satunya pembaca = poll()).
+        self._rc = []
+        self._rc_ts = 0.0
+        self._mc = None
+        self._params = {}
+        self._param_pending = {}
+        self._param_until = 0.0
+        self._last_hb_tx = 0.0
 
 
     def connect(self, timeout_s=8.0):
@@ -205,6 +218,7 @@ class MavlinkTelemetry:
             if msg is not None:
                 self.connected = True
                 self.last_heartbeat_time = time.time()
+                self._read_heartbeat(msg)
                 self._request_streams()
                 print(f"[MAV] Heartbeat diterima dari "
                       f"sysid={self.master.target_system} "
@@ -263,7 +277,7 @@ class MavlinkTelemetry:
         try:
             ip, prt = self._gcs_addr
             self._gcs = mavutil.mavlink_connection(
-                f"udpout:{ip}:{prt}", source_system=1,
+                f"udpout:{ip}:{prt}", source_system=255,
                 source_component=191)
             print(f"[MAV] Forward QGC aktif -> udp:{ip}:{prt}.")
         except Exception as exc:
@@ -308,12 +322,136 @@ class MavlinkTelemetry:
             pass
 
 
-    def poll(self):
-        """Baca SEMUA pesan yang mengantre; perbarui state internal.
+    def _read_heartbeat(self, msg):
+        self.last_heartbeat_time = time.time()
+        ap = int(getattr(msg, "autopilot", -1) or -1)
+        if ap in (-1, 8):
+            return
+        self._autopilot = ap
+        try:
+            self._flight_mode_id = int(getattr(msg, "custom_mode", 0) or 0)
+        except Exception:
+            pass
+        if self._gcs is not None:
+            now_hb = time.time()
+            if now_hb - getattr(self, "_last_gcs_hb", 0.0) >= 1.0:
+                self._last_gcs_hb = now_hb
+                try:
+                    self._gcs.mav.heartbeat_send(
+                        mavutil.mavlink.MAV_TYPE_SURFACE_BOAT,
+                        mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+                except Exception:
+                    pass
 
-        Bila GCS forward aktif, setiap pesan mentah ikut diteruskan ke
-        QGC via UDP (tanpa parsing ulang — murah di CPU).
-        """
+    def _handle(self, msg):
+        mtype = msg.get_type()
+        if mtype == "ATTITUDE":
+            self._attitude = {
+                "roll": msg.roll, "pitch": msg.pitch, "yaw": msg.yaw,
+            }
+        elif mtype == "GLOBAL_POSITION_INT":
+            if msg.lat != 0 or msg.lon != 0:
+                self._pos = (msg.lat / 1e7, msg.lon / 1e7)
+        elif mtype == "VFR_HUD":
+            self._groundspeed = msg.groundspeed
+        elif mtype == "RC_CHANNELS":
+            self._rc = [int(getattr(msg, f"chan{i}_raw", 0) or 0)
+                        for i in range(1, 17)]
+            self._rc_ts = time.time()
+        elif mtype == "MANUAL_CONTROL":
+            self._mc = (float(getattr(msg, "z", 500.0)),
+                        float(getattr(msg, "r", 0.0)), time.monotonic())
+        elif mtype == "PARAM_VALUE":
+            name = str(getattr(msg, "param_id", "")).strip("\x00 ")
+            if name:
+                self._params[name] = decode_param(msg)
+                self._param_pending.pop(name, None)
+        elif mtype == "SYS_STATUS":
+            vbatt = getattr(msg, "voltage_battery", 0) or 0
+            if vbatt not in (0, 0xFFFF, 65535):
+                self._voltage_v = vbatt / 1000.0
+            curr = getattr(msg, "current_battery", -1)
+            if curr is not None and curr >= 0:
+                self._current_a = curr / 100.0
+            rem = getattr(msg, "battery_remaining", -1)
+            if rem is not None and 0 <= rem <= 100:
+                self._battery_pct = float(rem)
+        elif mtype == "BATTERY_STATUS":
+            volts = getattr(msg, "voltages", None) or []
+            cells_mv = [v for v in volts if v not in (0, 0xFFFF, 65535)]
+            if cells_mv:
+                self._voltage_v = sum(cells_mv) / 1000.0
+            curr = getattr(msg, "current_battery", -1)
+            if curr is not None and curr >= 0:
+                self._current_a = curr / 100.0
+            rem = getattr(msg, "battery_remaining", -1)
+            if rem is not None and 0 <= rem <= 100:
+                self._battery_pct = float(rem)
+        elif mtype == "HEARTBEAT":
+            self._read_heartbeat(msg)
+
+    def _service_params(self):
+        """Kirim ulang PARAM_REQUEST_READ yang belum dijawab (maks 10 dtk)."""
+        if not self._param_pending or self.master is None:
+            return
+        now = time.monotonic()
+        if now >= self._param_until:
+            self._param_pending.clear()
+            return
+        ts = int(getattr(self.master, "target_system", 1) or 1)
+        tc = int(getattr(self.master, "target_component", 1) or 1)
+        for name, last in list(self._param_pending.items()):
+            if now - last < 0.5:
+                continue
+            try:
+                self.master.mav.param_request_read_send(
+                    ts, tc, name.encode(), -1)
+                self._param_pending[name] = now
+            except Exception:
+                pass
+
+    def _service_heartbeat(self):
+        """Kirim heartbeat GCS 1 Hz ke Pixhawk (syarat FS_GCS_ENABLE)."""
+        if self.master is None:
+            return
+        now = time.monotonic()
+        if now - self._last_hb_tx < 1.0:
+            return
+        self._last_hb_tx = now
+        try:
+            self.master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0,
+                mavutil.mavlink.MAV_STATE_ACTIVE)
+        except Exception:
+            pass
+
+    def _poll_gcs(self):
+        """Terima pesan QGC (UDP) lalu teruskan ke Pixhawk (dua arah)."""
+        g = self._gcs
+        if g is None or self.master is None:
+            return
+        for _ in range(32):
+            try:
+                msg = g.recv_match(blocking=False)
+            except Exception:
+                return
+            if msg is None:
+                return
+            mtype = msg.get_type()
+            if mtype == "BAD_DATA":
+                continue
+            if mtype == "MANUAL_CONTROL":
+                self._handle(msg)
+            if mtype in ("HEARTBEAT", "RADIO_STATUS"):
+                continue
+            try:
+                self.master.write(msg.get_msgbuf())
+            except Exception:
+                pass
+
+    def poll(self):
+        """Baca SEMUA pesan serial (satu-satunya pembaca) + QGC dua arah."""
         if not self.connected or self.master is None:
             return
         if self._gcs_enabled:
@@ -326,67 +464,38 @@ class MavlinkTelemetry:
                         self._gcs.write(msg.get_msgbuf())
                     except Exception:
                         pass
-                mtype = msg.get_type()
-                if mtype == "ATTITUDE":
-                    self._attitude = {
-                        "roll": msg.roll, "pitch": msg.pitch, "yaw": msg.yaw,
-                    }
-                elif mtype == "GLOBAL_POSITION_INT":
-
-                    if msg.lat != 0 or msg.lon != 0:
-                        self._pos = (msg.lat / 1e7, msg.lon / 1e7)
-                elif mtype == "VFR_HUD":
-                    self._groundspeed = msg.groundspeed
-                elif mtype == "SYS_STATUS":
-
-
-
-                    vbatt = getattr(msg, "voltage_battery", 0) or 0
-                    if vbatt not in (0, 0xFFFF, 65535):
-                        self._voltage_v = vbatt / 1000.0
-                    curr = getattr(msg, "current_battery", -1)
-                    if curr is not None and curr >= 0:
-                        self._current_a = curr / 100.0
-                    rem = getattr(msg, "battery_remaining", -1)
-                    if rem is not None and 0 <= rem <= 100:
-                        self._battery_pct = float(rem)
-                elif mtype == "BATTERY_STATUS":
-
-
-                    volts = getattr(msg, "voltages", None) or []
-                    cells_mv = [v for v in volts
-                                if v not in (0, 0xFFFF, 65535)]
-                    if cells_mv:
-                        self._voltage_v = sum(cells_mv) / 1000.0
-                    curr = getattr(msg, "current_battery", -1)
-                    if curr is not None and curr >= 0:
-                        self._current_a = curr / 100.0
-                    rem = getattr(msg, "battery_remaining", -1)
-                    if rem is not None and 0 <= rem <= 100:
-                        self._battery_pct = float(rem)
-                elif mtype == "HEARTBEAT":
-                    self.last_heartbeat_time = time.time()
-                    try:
-                        self._flight_mode_id = int(
-                            getattr(msg, "custom_mode", 0) or 0)
-                    except Exception:
-                        pass
-                    if self._gcs is not None:
-
-
-                        now_hb = time.time()
-                        if now_hb - getattr(self, "_last_gcs_hb", 0.0) >= 1.0:
-                            self._last_gcs_hb = now_hb
-                            try:
-                                self._gcs.mav.heartbeat_send(
-                                    mavutil.mavlink.MAV_TYPE_SURFACE_BOAT,
-                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                                    0, 0, 0)
-                            except Exception:
-                                pass
+                self._handle(msg)
                 msg = self.master.recv_match(blocking=False)
         except Exception as exc:
-            print(f"[MAV] Error poll: {exc}")
+            if throttled("mav_poll", 5.0):
+                print(f"[MAV] Error poll: {exc}")
+        self._service_params()
+        self._service_heartbeat()
+        self._poll_gcs()
+
+    @property
+    def autopilot_id(self):
+        return self._autopilot
+
+    def rc_snapshot(self):
+        """(list 16 channel, timestamp detik) — kosong bila belum ada."""
+        return self._rc, self._rc_ts
+
+    @property
+    def manual_control(self):
+        """(z, r, timestamp) MANUAL_CONTROL terakhir atau None."""
+        return self._mc
+
+    @property
+    def param_values(self):
+        return dict(self._params)
+
+    def request_params(self, names):
+        now = time.monotonic()
+        self._param_pending = {n: now for n in names}
+        self._param_until = now + 10.0
+        self._service_params()
+
 
 
     @property

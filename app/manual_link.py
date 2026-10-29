@@ -71,6 +71,7 @@ class ManualLink:
     def __init__(self, config):
         self.config = config
         self.master = None
+        self.feed = None
         self._ch = []
         self._last_rc_time = 0.0
         self._manual = None
@@ -82,9 +83,10 @@ class ManualLink:
 
 
 
-    def attach_mav(self, master):
-        """Sambungkan koneksi pymavlink Pixhawk (boleh None = RC mati)."""
+    def attach_mav(self, master, telemetry=None):
+        """Sambungkan koneksi Pixhawk + cache pembaca tunggal (boleh None)."""
         self.master = master
+        self.feed = telemetry
 
     def set_gamepad(self, path):
         """Pilih joystick USB (mis. /dev/input/js0; '' = mati)."""
@@ -113,7 +115,15 @@ class ManualLink:
         return sorted(glob.glob("/dev/input/js*"))
 
     def _poll_mav_rc(self):
-        """Ambil RC_CHANNELS terbaru (non-blocking); True bila ada frame."""
+        """Ambil RC terbaru dari cache telemetri (fallback recv_match)."""
+        feed = self.feed
+        if feed is not None:
+            ch, ts = feed.rc_snapshot()
+            if ch and ts > self._last_rc_time:
+                self._ch = ch
+                self._last_rc_time = ts
+                return True
+            return False
         if self.master is None:
             return False
         try:

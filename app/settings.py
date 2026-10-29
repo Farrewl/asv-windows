@@ -166,7 +166,7 @@ def track_waypoints(name=None):
 
 
 
-CAMERA_TARGET_FPS = 30
+CAMERA_TARGET_FPS = 60
 NAV_LOOP_FPS = 30
 CAMERA_MAX_AUTO_WIDTH = 1920
 CAMERA_MAX_AUTO_HEIGHT = 1080
@@ -259,7 +259,8 @@ TUNING_PARAM_KEYS = frozenset({
     "YOLO_FRAME_SKIP", "YOLO_INFERENCE_SIZE", "YOLO_RESULT_MAX_AGE_S",
 
     "SECONDARY_PREVIEW_INTERVAL", "SECONDARY_FPS", "SECONDARY_CACHE_WIDTH",
-    "VIDEO_GUI_HZ",
+    "VIDEO_GUI_HZ", "CAMERA_TARGET_FPS", "CAMERA_MIN_ACCEPT_FPS",
+    "NAV_LOOP_FPS", "GCS_FORWARD", "GCS_PORT",
 
     "MAV_CONNECT_TIMEOUT_S", "MAV_RETRY_INTERVAL_S",
 
@@ -331,14 +332,16 @@ class Config:
 
         self.FRAME_WIDTH = 1280
         self.FRAME_HEIGHT = 720
-        self.CAMERA_TARGET_FPS = CAMERA_TARGET_FPS
+        self.CAMERA_TARGET_FPS = int(saved.get('CAMERA_TARGET_FPS',
+                                               CAMERA_TARGET_FPS))
         try:
             self.NAV_LOOP_FPS = saved.get('NAV_LOOP_FPS', NAV_LOOP_FPS)
         except Exception:
-            self.NAV_LOOP_FPS = CAMERA_TARGET_FPS
+            self.NAV_LOOP_FPS = NAV_LOOP_FPS
         self.CAMERA_MAX_AUTO_WIDTH = CAMERA_MAX_AUTO_WIDTH
         self.CAMERA_MAX_AUTO_HEIGHT = CAMERA_MAX_AUTO_HEIGHT
-        self.CAMERA_MIN_ACCEPT_FPS = CAMERA_MIN_ACCEPT_FPS
+        self.CAMERA_MIN_ACCEPT_FPS = int(saved.get('CAMERA_MIN_ACCEPT_FPS',
+                                                   CAMERA_MIN_ACCEPT_FPS))
 
         # Fast-start kamera: buka sekali (mode cache/1280x720 MJPG) tanpa
         # sweep resolusi/codec berulang. Negosiasi penuh
@@ -361,6 +364,16 @@ class Config:
         self.SERIAL_PORT = saved.get('SERIAL_PORT', '')
         self.BAUD_RATE = 57600
         self.OFFBOARD_STREAM_RATE_HZ = 30
+
+        _env_gcs = os.environ.get("GCS_FORWARD")
+        if _env_gcs is None:
+            self.GCS_FORWARD = bool(saved.get('GCS_FORWARD', 1))
+        else:
+            self.GCS_FORWARD = _env_gcs.strip().lower() not in (
+                "0", "false", "off", "no")
+        self.GCS_IP = os.environ.get("GCS_IP", "127.0.0.1")
+        self.GCS_PORT = int(os.environ.get(
+            "GCS_PORT", int(saved.get('GCS_PORT', 14550))))
 
 
 

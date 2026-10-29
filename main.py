@@ -411,10 +411,12 @@ class MainWindow(QMainWindow):
     def _setup_status_bar(self):
         """4 chip saja: link, mode, baterai, FPS."""
         bar = self.statusBar()
+        self._fps_target = max(1, int(getattr(
+            self.nav_thread.config, "NAV_LOOP_FPS", 30) or 30))
         self.chip_link = QLabel("● --")
         self.chip_mode = QLabel("AUTO")
         self.chip_batt = QLabel("--")
-        self.chip_fps = QLabel("FPS --/30")
+        self.chip_fps = QLabel(f"FPS --/{self._fps_target}")
         for chip in (self.chip_link, self.chip_mode,
                      self.chip_batt, self.chip_fps):
             chip.setStyleSheet(
@@ -678,11 +680,16 @@ class MainWindow(QMainWindow):
             self._fps_val = self._fps_count / (now_m - self._fps_t0)
             self._fps_count = 0
             self._fps_t0 = now_m
-            fps_c = (theme.COLOR_OK if self._fps_val >= 27
+            cam_fps = float(data.get("cam_fps", 0.0) or 0.0)
+            loop_ok = self._fps_val >= self._fps_target * 0.9
+            cam_ok = cam_fps <= 0 or cam_fps >= 30.0
+            fps_c = (theme.COLOR_OK if loop_ok and cam_ok
                      else theme.COLOR_WARN if self._fps_val >= 15
                      else theme.COLOR_BAD)
-            self._set_chip(self.chip_fps, "fps",
-                           f"FPS {self._fps_val:.0f}/30", fps_c)
+            txt = f"FPS {self._fps_val:.0f}/{self._fps_target}"
+            if cam_fps > 0:
+                txt += f" · CAM {cam_fps:.0f}"
+            self._set_chip(self.chip_fps, "fps", txt, fps_c)
 
         now = time.time()
         if now - self._last_text_t < 0.2:
@@ -748,6 +755,14 @@ class MainWindow(QMainWindow):
             self.side_mode.setStyleSheet(
                 "font-family: monospace; font-weight: bold; font-size: 26px;"
                 f" color: {mode_c}; background: transparent;")
+        if "auto_started" in data:
+            started = bool(data.get("auto_started"))
+            if self.start_btn.isChecked() != started:
+                self.start_btn.blockSignals(True)
+                self.start_btn.setChecked(started)
+                self.start_btn.blockSignals(False)
+                self.start_btn.setText(
+                    "⏸ HOLD" if started else "▶ MULAI AUTO")
         self.side_rc.setText(f"RC: {'OK' if rc_ok else 'PUTUS'}"
                              f" | {'STICK' if man_on else 'AUTO'}")
         if self.side_state.text() != state:

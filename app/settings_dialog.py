@@ -243,6 +243,20 @@ class SettingsDialog(QDialog):
                       1.0, 30.0, 1.0)
         self._add_row(f, "CAMERA_FLIP_MODE:", "CAMERA_FLIP_MODE",
                       0, 3, 1, is_int=True)
+        self._add_header(f, "Kamera & FPS")
+        self._add_row(f, "CAMERA_TARGET_FPS:", "CAMERA_TARGET_FPS",
+                      15, 60, 5, is_int=True)
+        self._add_row(f, "CAMERA_MIN_ACCEPT_FPS:", "CAMERA_MIN_ACCEPT_FPS",
+                      10, 60, 5, is_int=True)
+        self._add_row(f, "NAV_LOOP_FPS:", "NAV_LOOP_FPS",
+                      10, 60, 5, is_int=True)
+        self._add_row(f, "VIDEO_GUI_HZ:", "VIDEO_GUI_HZ",
+                      0, 30, 1, is_int=True)
+        self._add_header(f, "QGroundControl (UDP)")
+        self._add_row(f, "GCS_FORWARD (0/1):", "GCS_FORWARD",
+                      0, 1, 1, is_int=True)
+        self._add_row(f, "GCS_PORT:", "GCS_PORT", 1024, 65535, 1,
+                      is_int=True)
         self._add_header(f, "Pixhawk Non-blocking + Histeresis (P6-B)")
         self._add_row(f, "MAV_CONNECT_TIMEOUT_S:", "MAV_CONNECT_TIMEOUT_S",
                       0.5, 10.0, 0.5)
